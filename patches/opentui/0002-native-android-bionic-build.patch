@@ -1,0 +1,119 @@
+diff --git a/packages/native/build.zig b/packages/native/build.zig
+index 0897ad6..35213d9 100644
+--- a/packages/native/build.zig
++++ b/packages/native/build.zig
+@@ -363,6 +363,8 @@ fn addMacOSSystemLibraries(b: *std.Build, module: *std.Build.Module, sdk_path: [
+ // Set by -Drequire-video. Release builds pass it so a missing FFmpeg prefix fails instead of shipping without video.
+ var require_video = false;
+ var video_enabled = true;
++var target_libc_file: ?[]const u8 = null;
++var android_sysroot_path: ?[]const u8 = null;
+ var video_unavailable_warned: std.StringHashMapUnmanaged(void) = .empty;
+ 
+ // Names the FFmpeg prefix that scripts/build-ffmpeg.ts builds for this target, if any.
+@@ -450,9 +452,27 @@ fn addNativeAudioDependencies(
+     switch (target.result.os.tag) {
+         .macos => addMacOSSystemLibraries(b, module, macos_sdk_path.?),
+         .linux => {
+-            module.linkSystemLibrary("dl", .{});
+-            module.linkSystemLibrary("pthread", .{});
+-            module.linkSystemLibrary("m", .{});
++            if (target.result.abi.isAndroid()) {
++                if (android_sysroot_path) |sysroot| {
++                    const arch_lib = switch (target.result.cpu.arch) {
++                        .arm, .thumb => "arm-linux-androideabi",
++                        .aarch64 => "aarch64-linux-android",
++                        .x86 => "i686-linux-android",
++                        .x86_64 => "x86_64-linux-android",
++                        else => null,
++                    };
++                    if (arch_lib) |triple| {
++                        const api = target.result.os.version_range.linux.android;
++                        module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr", "lib", triple, b.fmt("{d}", .{api}) }) });
++                        module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr", "lib", triple }) });
++                    }
++                }
++            }
++            module.linkSystemLibrary("dl", .{ .use_pkg_config = .no });
++            if (!target.result.abi.isAndroid()) {
++                module.linkSystemLibrary("pthread", .{});
++            }
++            module.linkSystemLibrary("m", .{ .use_pkg_config = .no });
+         },
+         else => {},
+     }
+@@ -489,6 +509,20 @@ fn ghosttyVtAvailable(target: std.Build.ResolvedTarget) bool {
+     };
+ }
+ 
++fn addAndroidTranslateIncludes(b: *std.Build, tc: *std.Build.Step.TranslateC, target: std.Build.ResolvedTarget) void {
++    if (!target.result.abi.isAndroid()) return;
++    const sysroot = android_sysroot_path orelse return;
++    const arch_include = switch (target.result.cpu.arch) {
++        .arm, .thumb => "arm-linux-androideabi",
++        .aarch64 => "aarch64-linux-android",
++        .x86 => "i686-linux-android",
++        .x86_64 => "x86_64-linux-android",
++        else => return,
++    };
++    tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr", "include", arch_include }) });
++    tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr", "include" }) });
++}
++
+ fn addTranslatedCImports(
+     b: *std.Build,
+     module: *std.Build.Module,
+@@ -501,6 +535,7 @@ fn addTranslatedCImports(
+         .optimize = optimize,
+     });
+     miniaudio_translate.addIncludePath(b.path("src"));
++    addAndroidTranslateIncludes(b, miniaudio_translate, target);
+     module.addImport("miniaudio", miniaudio_translate.createModule());
+ 
+     const yoga_dep = b.dependency("yoga", .{});
+@@ -510,6 +545,7 @@ fn addTranslatedCImports(
+         .optimize = optimize,
+     });
+     yoga_translate.addIncludePath(yoga_dep.path(""));
++    addAndroidTranslateIncludes(b, yoga_translate, target);
+     module.addImport("yoga", yoga_translate.createModule());
+     addContextABIHeader(b, module, optimize, target);
+ }
+@@ -525,6 +561,7 @@ fn addContextABIHeader(
+         .target = target,
+         .optimize = optimize,
+     });
++    addAndroidTranslateIncludes(b, header, target);
+     module.addImport("context_abi_c", header.createModule());
+ }
+ 
+@@ -617,6 +654,8 @@ pub fn build(b: *std.Build) void {
+     const gpa_safe_stats = b.option(bool, "gpa-safe-stats", "Enable GPA safety checks for trustworthy allocator stats") orelse false;
+     require_video = b.option(bool, "require-video", "Fail when a target's FFmpeg prefix is missing instead of building without video") orelse false;
+     video_enabled = b.option(bool, "video", "Enable FFmpeg video decoding when available") orelse true;
++    target_libc_file = b.option([]const u8, "libc-file", "Path to Zig libc configuration file for cross-compilation (e.g., Android NDK)");
++    android_sysroot_path = b.option([]const u8, "android-sysroot", "Path to Android NDK sysroot for translate-c headers");
+     if (require_video and !video_enabled) {
+         std.debug.print("error: -Drequire-video conflicts with -Dvideo=false\n", .{});
+         std.process.exit(1);
+@@ -939,6 +978,7 @@ fn buildTarget(
+     const build_step_name = try std.fmt.allocPrint(b.allocator, "build-{s}", .{output_name});
+     const build_step = b.step(build_step_name, try std.fmt.allocPrint(b.allocator, "Build for {s}", .{description}));
+     for (createLibraries(b, target, optimize, build_options, macos_sdk_path)) |lib| {
++        if (lib.isStaticLibrary() and target.result.abi.isAndroid()) continue;
+         const windows = target.result.os.tag == .windows;
+         if (lib.isStaticLibrary() and (windows or target.result.os.tag == .linux)) {
+             // Linux has no system libc++ to count on, so the archive carries Zig's. MSVC has none of MinGW's
+@@ -1013,6 +1053,12 @@ fn createLibraries(
+         .root_module = module,
+         .linkage = .dynamic,
+     });
++    if (target_libc_file) |libc_path| {
++        shared.setLibCFile(.{ .cwd_relative = libc_path });
++    }
++    if (target.result.abi.isAndroid()) {
++        shared.root_module.strip = (optimize != .debug);
++    }
+     if (target.result.os.tag == .linux and optimize != .debug) shared.build_id = .sha1;
+     // Zig's default DLL entry skips the MinGW CRT startup, so CRT state such as
+     // the DLL atexit table would stay uninitialized. MinGW's strtod registers

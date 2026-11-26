@@ -1,0 +1,282 @@
+diff --git a/packages/native/src/audio.zig b/packages/native/src/audio.zig
+index ffa3023..dcf4fea 100644
+--- a/packages/native/src/audio.zig
++++ b/packages/native/src/audio.zig
+@@ -1,5 +1,21 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
++
++// 32-bit ARM targets (armv7a / android-arm) may not lower 64-bit atomics natively without libatomic.
++// Guard statistics counters with a lightweight u32 spinlock to keep them lock-free-compatible everywhere.
++var u64_counter_lock: std.atomic.Value(u32) = .init(0);
++fn u64CounterAdd(ptr: *u64, value: u64) void {
++    while (u64_counter_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    ptr.* +%= value;
++    u64_counter_lock.store(0, .release);
++}
++fn u64CounterLoad(ptr: *u64) u64 {
++    while (u64_counter_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    const value = ptr.*;
++    u64_counter_lock.store(0, .release);
++    return value;
++}
++
+ const c = @import("miniaudio");
+ const io = if (builtin.is_test) std.testing.io else @import("root").io;
+ 
+@@ -186,7 +202,7 @@ pub const CaptureBuffer = struct {
+     // This is the sole producer path. It never waits for space and drops the newest frames on overflow.
+     pub fn write(self: *CaptureBuffer, input: [*]const f32, frame_count: u32) void {
+         if (frame_count == 0) return;
+-        _ = @atomicRmw(u64, &self.frames_received, .Add, frame_count, .monotonic);
++        u64CounterAdd(&self.frames_received, frame_count);
+ 
+         const frames_to_write = @min(frame_count, c.ma_pcm_rb_available_write(&self.ring));
+         var total_written: u32 = 0;
+@@ -210,7 +226,7 @@ pub const CaptureBuffer = struct {
+ 
+         const dropped = frame_count - total_written;
+         if (dropped > 0) {
+-            _ = @atomicRmw(u64, &self.frames_dropped, .Add, dropped, .monotonic);
++            u64CounterAdd(&self.frames_dropped, dropped);
+         }
+     }
+ 
+@@ -237,16 +253,16 @@ pub const CaptureBuffer = struct {
+         }
+ 
+         if (total_read > 0) {
+-            _ = @atomicRmw(u64, &self.frames_read, .Add, total_read, .monotonic);
++            u64CounterAdd(&self.frames_read, total_read);
+         }
+         return total_read;
+     }
+ 
+     pub fn snapshot(self: *CaptureBuffer) CaptureStats {
+         return .{
+-            .frames_received = @atomicLoad(u64, &self.frames_received, .monotonic),
+-            .frames_read = @atomicLoad(u64, &self.frames_read, .monotonic),
+-            .frames_dropped = @atomicLoad(u64, &self.frames_dropped, .monotonic),
++            .frames_received = u64CounterLoad(&self.frames_received),
++            .frames_read = u64CounterLoad(&self.frames_read),
++            .frames_dropped = u64CounterLoad(&self.frames_dropped),
+             .sample_rate = self.sample_rate,
+             .channels = self.channels,
+             .buffered_frames = c.ma_pcm_rb_available_read(&self.ring),
+@@ -706,7 +722,7 @@ fn streamDataSourceRead(
+     }
+ 
+     if (total_read > 0) {
+-        _ = @atomicRmw(u64, &stream.frames_played, .Add, total_read, .monotonic);
++        u64CounterAdd(&stream.frames_played, total_read);
+     }
+ 
+     available = c.ma_pcm_rb_available_read(&stream.pcm_ring);
+@@ -934,11 +950,11 @@ fn streamDecoderWorker(stream: *Stream) void {
+             const input = if (input_frames != 0) samples[input_offset / @sizeOf(f32) ..].ptr else null;
+             if (input == null) {
+                 const input_rate = stream.input_sample_rate;
+-                const received_frames = @atomicLoad(u64, &stream.bytes_received, .monotonic) / frame_bytes;
++                const received_frames = u64CounterLoad(&stream.bytes_received) / frame_bytes;
+                 // Round input latency separately to preserve sub-frame downsampling tails.
+                 const tail = (@as(u128, c.ma_data_converter_get_input_latency(&converter)) * stream.sample_rate + input_rate - 1) / input_rate;
+                 const target: u64 = if (received_frames == 0) 0 else @intCast((@as(u128, received_frames) * stream.sample_rate + input_rate - 1) / input_rate + tail);
+-                const produced = @atomicLoad(u64, &stream.frames_decoded, .monotonic);
++                const produced = u64CounterLoad(&stream.frames_decoded);
+                 frames_read = @min(frames_read, target -| produced);
+                 if (frames_read == 0) break :blk c.MA_AT_END;
+                 input_frames = stream_decoder_chunk_frames;
+@@ -959,7 +975,7 @@ fn streamDecoderWorker(stream: *Stream) void {
+                 failDecoderWorker(stream);
+                 return;
+             }
+-            _ = @atomicRmw(u64, &stream.frames_decoded, .Add, decoded_frames, .monotonic);
++            u64CounterAdd(&stream.frames_decoded, decoded_frames);
+         }
+ 
+         if (decoderExitRequested(stream)) return;
+@@ -975,7 +991,7 @@ fn streamDecoderWorker(stream: *Stream) void {
+             }
+             if (@atomicLoad(u32, &stream.input_ended, .acquire) != 0) {
+                 @atomicStore(u32, &stream.decoder_finished, 1, .release);
+-                if (is_pcm and @atomicLoad(u64, &stream.frames_decoded, .monotonic) == 0) endStreamPlayback(stream);
++                if (is_pcm and u64CounterLoad(&stream.frames_decoded) == 0) endStreamPlayback(stream);
+                 stream.input_lock.unlock(io);
+                 return;
+             }
+@@ -1932,7 +1948,7 @@ pub fn writeStream(
+ 
+     stream.input_write = (stream.input_write + write_count) % stream.input_buffer.len;
+     stream.input_count += write_count;
+-    _ = @atomicRmw(u64, &stream.bytes_received, .Add, write_count, .monotonic);
++    u64CounterAdd(&stream.bytes_received, write_count);
+     stream.input_condition.signal(io);
+     return @intCast(write_count);
+ }
+@@ -2063,9 +2079,9 @@ pub fn setStreamGroup(engine: *Engine, stream_id: u32, group_id: u32) i32 {
+ 
+ fn snapshotStream(stream: *Stream, final: bool) StreamStats {
+     return .{
+-        .bytes_received = @atomicLoad(u64, &stream.bytes_received, .monotonic),
+-        .frames_decoded = @atomicLoad(u64, &stream.frames_decoded, .monotonic),
+-        .frames_played = @atomicLoad(u64, &stream.frames_played, .monotonic),
++        .bytes_received = u64CounterLoad(&stream.bytes_received),
++        .frames_decoded = u64CounterLoad(&stream.frames_decoded),
++        .frames_played = u64CounterLoad(&stream.frames_played),
+         .state = loadStreamState(stream),
+         .sample_rate = stream.sample_rate,
+         .channels = 2,
+diff --git a/packages/native/src/context-abi.zig b/packages/native/src/context-abi.zig
+index 1d8dcae..4511a69 100644
+--- a/packages/native/src/context-abi.zig
++++ b/packages/native/src/context-abi.zig
+@@ -5323,7 +5323,7 @@ fn nullablePointer(comptime T: type) ?std.lang.Type.Pointer {
+ // export_symbols. These checks tie the header to Zig declarations that it does not define.
+ comptime {
+     @setEvalBranchQuota(10_000);
+-    if (@sizeOf(usize) != 8) @compileError("The OpenTUI C ABI requires a 64-bit target");
++    if (@sizeOf(usize) != 4 and @sizeOf(usize) != 8) @compileError("The OpenTUI C ABI requires a 32-bit or 64-bit target");
+     const MousePointerStyle = @import("terminal.zig").MousePointerStyle;
+     for (std.meta.tags(MousePointerStyle)) |style| {
+         var name: [@tagName(style).len]u8 = undefined;
+diff --git a/packages/native/src/context-handles.zig b/packages/native/src/context-handles.zig
+index fa113e1..c059db2 100644
+--- a/packages/native/src/context-handles.zig
++++ b/packages/native/src/context-handles.zig
+@@ -37,7 +37,16 @@ pub const Error = error{
+ };
+ 
+ // Only identity allocation is shared. IDs never wrap or identify a later context.
+-var last_context_id: std.atomic.Value(u64) = .init(0);
++var last_context_id_lock: std.atomic.Value(u32) = .init(0);
++var last_context_id: u64 = 0;
++
++fn nextContextId() Error!u64 {
++    while (last_context_id_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    defer last_context_id_lock.store(0, .release);
++    if (last_context_id == std.math.maxInt(u64)) return error.ContextLimit;
++    last_context_id += 1;
++    return last_context_id;
++}
+ 
+ const Slot = struct {
+     generation: u32 = 1,
+@@ -71,14 +80,8 @@ pub const Table = struct {
+     /// slot_count_max. A larger `capacity` never grows.
+     pub fn init(allocator: std.mem.Allocator, capacity: u32) Error!Table {
+         std.debug.assert(capacity > 0);
+-        var id = last_context_id.load(.monotonic);
+-        while (true) {
+-            if (id == std.math.maxInt(u64)) return error.ContextLimit;
+-            if (last_context_id.cmpxchgWeak(id, id + 1, .monotonic, .monotonic)) |current| {
+-                id = current;
+-            } else break;
+-        }
+-        var table: Table = .{ .allocator = allocator, .context_id = id + 1 };
++        const id = try nextContextId();
++        var table: Table = .{ .allocator = allocator, .context_id = id };
+         try table.grow(capacity);
+         return table;
+     }
+diff --git a/packages/native/src/scene-record.zig b/packages/native/src/scene-record.zig
+index 31cb1cd..33b1b22 100644
+--- a/packages/native/src/scene-record.zig
++++ b/packages/native/src/scene-record.zig
+@@ -153,7 +153,7 @@ fn command(operation: u32) !Command {
+ }
+ 
+ comptime {
+-    std.debug.assert(@sizeOf(usize) >= 8); // commandSize adds up to four u32 lengths.
++    std.debug.assert(@sizeOf(usize) >= 4); // commandSize uses u64 arithmetic so 32-bit targets never overflow.
+     // Each OT_SCENE_RECORD_<NAME> type has an equal Command tag, and each tag has a type.
+     @setEvalBranchQuota(200_000);
+     var count = 0;
+@@ -169,40 +169,40 @@ comptime {
+ }
+ 
+ /// Unpadded byte count of a command record, after checking its fixed fields.
+-fn commandSize(operation: Command, body: []const u8) !usize {
++fn commandSize(operation: Command, body: []const u8) !u64 {
+     switch (operation) {
+         .draw => {
+             const value = try fixed(c.ot_scene_record_draw, body);
+             const draw = try fixed(c.ot_buffer_draw_header, body[@sizeOf(c.ot_scene_record_draw)..]);
+             if (value.text_length > c.OT_BUFFER_TEXT_BYTES_MAX or value.bottom_length > c.OT_BUFFER_TEXT_BYTES_MAX or
+                 (draw.operation != c.OT_BUFFER_DRAW_COMPOSE and !zeroHandle(value.source))) return error.InvalidOptions;
+-            return @sizeOf(c.ot_scene_record_draw) + @as(usize, draw.struct_size) + value.text_length + value.bottom_length;
++            return @as(u64, @sizeOf(c.ot_scene_record_draw)) + draw.struct_size + value.text_length + value.bottom_length;
+         },
+         .stack => return @sizeOf(c.ot_scene_record_stack),
+         .grid => {
+             const value = try fixed(c.ot_scene_record_grid, body);
+-            return @sizeOf(c.ot_scene_record_grid) + (@as(usize, value.column_count) + value.row_count) * @sizeOf(i32);
++            return @as(u64, @sizeOf(c.ot_scene_record_grid)) + (@as(u64, value.column_count) + value.row_count) * @sizeOf(i32);
+         },
+         .@"packed" => {
+             const value = try fixed(c.ot_scene_record_packed, body);
+             if (value.reserved != 0) return error.InvalidOptions;
+-            return @sizeOf(c.ot_scene_record_packed) + @as(usize, value.byte_count);
++            return @as(u64, @sizeOf(c.ot_scene_record_packed)) + value.byte_count;
+         },
+         .supersample => {
+             const value = try fixed(c.ot_scene_record_supersample, body);
+             if (value.reserved != 0) return error.InvalidOptions;
+-            return @sizeOf(c.ot_scene_record_supersample) + @as(usize, value.byte_count);
++            return @as(u64, @sizeOf(c.ot_scene_record_supersample)) + value.byte_count;
+         },
+         .grayscale => {
+             const value = try fixed(c.ot_scene_record_grayscale, body);
+             const flags = c.OT_SCENE_RECORD_GRAYSCALE_FOREGROUND | c.OT_SCENE_RECORD_GRAYSCALE_BACKGROUND | c.OT_SCENE_RECORD_GRAYSCALE_SUPERSAMPLED;
+             if (value.flags & ~@as(u32, flags) != 0) return error.InvalidOptions;
+-            return @sizeOf(c.ot_scene_record_grayscale) + @as(usize, value.sample_count) * @sizeOf(f32);
++            return @as(u64, @sizeOf(c.ot_scene_record_grayscale)) + @as(u64, value.sample_count) * @sizeOf(f32);
+         },
+         .color_matrix => {
+             const value = try fixed(c.ot_scene_record_color_matrix, body);
+             if (value.has_mask > 1 or (value.has_mask == 0 and value.mask_count != 0)) return error.InvalidOptions;
+-            return @sizeOf(c.ot_scene_record_color_matrix) + @as(usize, value.mask_count) * @sizeOf(f32);
++            return @as(u64, @sizeOf(c.ot_scene_record_color_matrix)) + @as(u64, value.mask_count) * @sizeOf(f32);
+         },
+         .text_view, .editor_view, .scene_body => return @sizeOf(c.ot_scene_record_view),
+         .image => return @sizeOf(c.ot_scene_record_image),
+@@ -210,7 +210,7 @@ fn commandSize(operation: Command, body: []const u8) !usize {
+         .cells => {
+             const value = try fixed(c.ot_scene_record_cells, body);
+             if (value.width == 0) return error.InvalidOptions;
+-            return @sizeOf(c.ot_scene_record_cells) + @as(usize, value.count) * @sizeOf(c.ot_scene_cell);
++            return @as(u64, @sizeOf(c.ot_scene_record_cells)) + @as(u64, value.count) * @sizeOf(c.ot_scene_cell);
+         },
+     }
+ }
+@@ -241,7 +241,7 @@ pub fn index(bytes: []const u8, slots: []const PaintSlot, segments: []Segments)
+             current.?.* = .{ .start = @intCast(offset + size), .end = @intCast(offset + size) };
+         } else {
+             const segment = current orelse return error.InvalidOptions;
+-            if (std.mem.alignForward(usize, try commandSize(try command(header.operation), body), 8) != size) return error.InvalidOptions;
++            if (std.mem.alignForward(u64, try commandSize(try command(header.operation), body), 8) != size) return error.InvalidOptions;
+             segment.end = @intCast(offset + size);
+         }
+         offset += size;
+diff --git a/packages/native/src/utils.zig b/packages/native/src/utils.zig
+index 5e16772..ec551ef 100644
+--- a/packages/native/src/utils.zig
++++ b/packages/native/src/utils.zig
+@@ -88,12 +88,16 @@ test "base64Encode matches the standard encoder at every length" {
+     }
+ }
+ 
+-var paint_clock = std.atomic.Value(u64).init(0);
++var paint_clock_lock: std.atomic.Value(u32) = .init(0);
++var paint_clock: u64 = 0;
+ 
+ /// A paint epoch that no resource, node, or style in the process has held: retained
+ /// paint compares epochs, so a new or replaced input never matches an old one.
+ pub fn nextPaintEpoch() u64 {
+-    return paint_clock.fetchAdd(1, .monotonic) + 1;
++    while (paint_clock_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    defer paint_clock_lock.store(0, .release);
++    paint_clock +%= 1;
++    return paint_clock;
+ }
+ 
+ // Prevent constant-zero specialization back to Zig's byte-store memset.

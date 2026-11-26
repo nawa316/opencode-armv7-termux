@@ -1,0 +1,8 @@
+out/
+work/
+.cache/
+*.deb
+*.tar.gz
+*.tar.xz
+*.log
+.DS_Store
