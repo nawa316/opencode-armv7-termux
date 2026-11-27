@@ -66,7 +66,7 @@ jobs:
           DEB="out/opencode_${OPENCODE_VERSION}-${PACKAGE_REVISION}_arm.deb"
           dpkg-deb --info "$DEB"
           dpkg-deb --contents "$DEB"
-          sha256sum "$DEB" > "${DEB}.sha256"
+          (cd out && sha256sum "$(basename "$DEB")" > "$(basename "$DEB").sha256")
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4

@@ -87,7 +87,12 @@ curl -fL --progress-bar "${BASE_URL}/${DEB_NAME}" -o "${TMPDIR_WORK}/${DEB_NAME}
 if curl -fsSL "${BASE_URL}/${DEB_NAME}.sha256" -o "${TMPDIR_WORK}/${DEB_NAME}.sha256" 2>/dev/null; then
   if command -v sha256sum >/dev/null 2>&1; then
     info "Verifying SHA-256 checksum..."
-    (cd "$TMPDIR_WORK" && sha256sum -c "${DEB_NAME}.sha256")
+    EXPECTED_SHA="$(awk '{print $1; exit}' "${TMPDIR_WORK}/${DEB_NAME}.sha256")"
+    ACTUAL_SHA="$(sha256sum "${TMPDIR_WORK}/${DEB_NAME}" | awk '{print $1; exit}')"
+    if [ -n "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+      die "SHA-256 mismatch! expected=${EXPECTED_SHA} actual=${ACTUAL_SHA}"
+    fi
+    ok "SHA-256 verified (${ACTUAL_SHA})"
   fi
 else
   warn "Checksum file not found for ${DEB_NAME}; skipping SHA-256 check."
