@@ -50,7 +50,7 @@ Version: ${OPENCODE_VERSION}-${PACKAGE_REVISION}
 Architecture: arm
 Maintainer: opencode-armv7-termux contributors <https://github.com/anomalyco/opencode>
 Installed-Size: ${INSTALLED_SIZE}
-Depends: nodejs (>= ${NODE_MIN_VERSION}), ripgrep
+Depends: nodejs | nodejs-lts, ripgrep, ca-certificates
 Recommends: git
 Section: devel
 Priority: optional

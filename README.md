@@ -29,11 +29,19 @@ This repository:
 
 ---
 
-## Install on Termux
+## Quick Install on Termux (One Command)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nawa316/opencode-armv7-termux/main/install.sh | bash
+```
+
+This automatically installs required Termux dependencies (`nodejs`, `ripgrep`, `ca-certificates` for Android 7.1.1 TLS), downloads the latest `opencode_*_arm.deb` from GitHub Releases, verifies its SHA-256 checksum, and installs it.
+
+### Manual Install
 
 ```sh
 pkg update && pkg upgrade -y
-pkg install -y nodejs ripgrep git
+pkg install -y nodejs ripgrep ca-certificates git
 apt install ./opencode_2.4.1-1_arm.deb
 ```
 

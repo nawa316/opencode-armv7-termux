@@ -25,9 +25,29 @@ if "$NODE" --use-system-ca -e "" >/dev/null 2>&1; then
 fi
 
 # Cap V8 old-space heap to stay within 32-bit virtual address space and <= 2 GB RAM devices.
-# Override with OPENCODE_MAX_OLD_SPACE_SIZE=<MB> (e.g., 384 on 1 GB RAM, 768 on 3+ GB RAM).
-MAX_HEAP="${OPENCODE_MAX_OLD_SPACE_SIZE:-512}"
+# Auto-tune based on device MemTotal (e.g. 384 MB on <= 1.8 GB Android 7.1.1 tablets,
+# 512 MB on 2-3 GB, 768 MB on > 3 GB), or override via OPENCODE_MAX_OLD_SPACE_SIZE=<MB>.
+if [ -n "${OPENCODE_MAX_OLD_SPACE_SIZE:-}" ]; then
+  MAX_HEAP="$OPENCODE_MAX_OLD_SPACE_SIZE"
+else
+  MEM_KB="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  if [ "${MEM_KB:-0}" -gt 0 ] && [ "$MEM_KB" -lt 1800000 ]; then
+    MAX_HEAP=384
+  elif [ "${MEM_KB:-0}" -gt 3100000 ]; then
+    MAX_HEAP=768
+  else
+    MAX_HEAP=512
+  fi
+fi
 NODE_FLAGS="$NODE_FLAGS --max-old-space-size=$MAX_HEAP --disable-warning=ExperimentalWarning"
+
+# Android 7.1.1 compatibility: ensure Termux temp dir and fresh Mozilla CA bundle are used
+# (Android 7.1.1 system root CAs are expired for modern API endpoints).
+export TMPDIR="${TMPDIR:-$PREFIX/tmp}"
+if [ -r "$PREFIX/etc/tls/cert.pem" ]; then
+  export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
+  export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-$PREFIX/etc/tls/cert.pem}"
+fi
 
 # Detect whether the invocation will launch the interactive OpenTUI frontend
 WANTS_TUI=1
