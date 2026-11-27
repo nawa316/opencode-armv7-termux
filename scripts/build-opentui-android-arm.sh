@@ -112,6 +112,21 @@ if command -v readelf >/dev/null 2>&1; then
   fi
   OT_COUNT=$(readelf --dyn-syms -W "$OUT_LIB" | grep -c " ot_")
   echo "[build-opentui] exported ot_* symbols: $OT_COUNT"
+
+  # Ensure EVERY undefined dynamic symbol exists in Android API $ANDROID_API libc/libm/libdl
+  API_LIB_DIR="$SYSROOT/usr/lib/arm-linux-androideabi/$ANDROID_API"
+  readelf --dyn-syms -W "$API_LIB_DIR/libc.so" "$API_LIB_DIR/libm.so" "$API_LIB_DIR/libdl.so" \
+    | awk '$7 != "UND" && $8 != "" {sub(/@.*/, "", $8); print $8}' | sort -u > "$WORK_DIR/api${ANDROID_API}_syms.txt"
+  readelf --dyn-syms -W "$OUT_LIB" \
+    | awk '$7 == "UND" && $8 != "" {sub(/@.*/, "", $8); print $8}' | sort -u > "$WORK_DIR/lib_und_syms.txt"
+  MISSING_SYMS=$(comm -23 "$WORK_DIR/lib_und_syms.txt" "$WORK_DIR/api${ANDROID_API}_syms.txt")
+  rm -f "$WORK_DIR/api${ANDROID_API}_syms.txt" "$WORK_DIR/lib_und_syms.txt"
+  if [ -n "$MISSING_SYMS" ]; then
+    echo "Error: libopentui.so references symbols missing from Android API $ANDROID_API Bionic:" >&2
+    echo "$MISSING_SYMS" >&2
+    exit 1
+  fi
+  echo "[build-opentui] Android API $ANDROID_API symbol audit: 0 missing symbols"
 fi
 
 # Verify all 101 C ABI struct layouts on arm-linux-androideabi.<API>

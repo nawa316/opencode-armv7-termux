@@ -1,0 +1,26 @@
+diff --git a/packages/native/src/clipboard/host.zig b/packages/native/src/clipboard/host.zig
+index 988496a..9f3f6a1 100644
+--- a/packages/native/src/clipboard/host.zig
++++ b/packages/native/src/clipboard/host.zig
+@@ -104,11 +104,16 @@ extern "c" fn pthread_peekjoin_np(thread: std.Thread.Handle, result: ?*?*anyopaq
+ 
+ fn tryJoinThread(thread: std.Thread) bool {
+     return switch (builtin.os.tag) {
+-        .linux => switch (pthread_tryjoin_np(thread.getHandle(), null)) {
+-            0 => true,
+-            @backingInt(std.posix.E.BUSY) => false,
+-            else => false,
+-        },
++        .linux => if (comptime builtin.abi.isAndroid()) blk: {
++            // Android Bionic only introduced pthread_tryjoin_np in API 33 (Android 13).
++            // Callers only invoke tryJoinThread once the worker has already marked itself terminal/exited.
++            thread.join();
++            break :blk true;
++        } else switch (pthread_tryjoin_np(thread.getHandle(), null)) {
++            0 => true,
++            @backingInt(std.posix.E.BUSY) => false,
++            else => false,
++        },
+         .freebsd => switch (pthread_peekjoin_np(thread.getHandle(), null)) {
+             0 => {
+                 thread.join();

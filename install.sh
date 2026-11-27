@@ -7,8 +7,8 @@
 set -euo pipefail
 
 REPO="nawa316/opencode-armv7-termux"
-DEFAULT_TAG="v2.4.1"
-PACKAGE_REVISION="1"
+DEFAULT_TAG="v2.4.1-2"
+DEFAULT_DEB="opencode_2.4.1-2_arm.deb"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 
 if [ -t 1 ]; then
@@ -46,20 +46,29 @@ ANDROID_VER="$(getprop ro.build.version.release 2>/dev/null || echo unknown)"
 ANDROID_SDK="$(getprop ro.build.version.sdk 2>/dev/null || echo unknown)"
 info "Detected Termux arm (Android ${ANDROID_VER}, API ${ANDROID_SDK})"
 
-# Resolve latest release tag from GitHub API (allow override via OPENCODE_TAG)
+# Resolve latest release tag & .deb asset from GitHub API (allow override via OPENCODE_TAG)
 TAG="${OPENCODE_TAG:-}"
-if [ -z "$TAG" ]; then
+DEB_NAME=""
+if [ -n "$TAG" ]; then
+  API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+else
   info "Checking latest release of $REPO..."
-  TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n 1 || true)"
-  if [ -z "$TAG" ]; then
-    warn "Could not query GitHub Releases API; falling back to ${DEFAULT_TAG}."
-    TAG="$DEFAULT_TAG"
-  fi
+  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 fi
-VERSION="${TAG#v}"
-DEB_NAME="opencode_${VERSION}-${PACKAGE_REVISION}_arm.deb"
+
+RELEASE_JSON="$(curl -fsSL "$API_URL" 2>/dev/null || true)"
+if [ -n "$RELEASE_JSON" ]; then
+  if [ -z "$TAG" ]; then
+    TAG="$(printf '%s\n' "$RELEASE_JSON" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+  fi
+  DEB_NAME="$(printf '%s\n' "$RELEASE_JSON" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(opencode_[^"]*_arm\.deb\)".*/\1/p' | head -n 1 || true)"
+fi
+
+if [ -z "$TAG" ] || [ -z "$DEB_NAME" ]; then
+  warn "Could not query GitHub Releases API; falling back to ${DEFAULT_TAG} (${DEFAULT_DEB})."
+  TAG="${TAG:-$DEFAULT_TAG}"
+  DEB_NAME="${DEB_NAME:-$DEFAULT_DEB}"
+fi
 BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
 
 info "Target release: ${TAG} (${DEB_NAME})"
