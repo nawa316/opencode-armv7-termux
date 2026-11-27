@@ -7,8 +7,8 @@
 set -euo pipefail
 
 REPO="nawa316/opencode-armv7-termux"
-DEFAULT_TAG="v2.4.1-2"
-DEFAULT_DEB="opencode_2.4.1-2_arm.deb"
+DEFAULT_TAG="v2.4.1-3"
+DEFAULT_DEB="opencode_2.4.1-3_arm.deb"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 
 if [ -t 1 ]; then

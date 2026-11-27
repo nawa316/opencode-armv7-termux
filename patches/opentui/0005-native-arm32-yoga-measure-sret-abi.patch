@@ -1,0 +1,175 @@
+diff --git a/packages/native/src/yoga-bridge.cpp b/packages/native/src/yoga-bridge.cpp
+index bbce807..c265915 100644
+--- a/packages/native/src/yoga-bridge.cpp
++++ b/packages/native/src/yoga-bridge.cpp
+@@ -217,6 +217,53 @@ uint32_t otYogaNodeSetMeasureFunc(YGNodeRef node, YGMeasureFunc callback,
+   });
+ }
+ 
++// On 32-bit ARM softfp (arm-linux-androideabi), Clang returns the 8-byte YGSize struct via a hidden
++// sret pointer in r0 whereas Zig's C ABI lowers extern struct { f32, f32 } in r0:r1. Keeping the
++// YGMeasureFunc trampoline in C++ ensures Clang handles sret and invokes Zig via out-pointers.
++static OTYogaMeasureOutFunc g_measure_out_js = nullptr;
++static OTYogaMeasureOutFunc g_measure_out_native = nullptr;
++
++static YGSize otYogaTrampolineMeasureJs(
++    YGNodeConstRef node, float width, YGMeasureMode width_mode,
++    float height, YGMeasureMode height_mode) {
++  YGSize result = {YGUndefined, YGUndefined};
++  if (g_measure_out_js) {
++    g_measure_out_js(node, width, width_mode, height, height_mode, &result.width, &result.height);
++  }
++  return result;
++}
++
++static YGSize otYogaTrampolineMeasureNative(
++    YGNodeConstRef node, float width, YGMeasureMode width_mode,
++    float height, YGMeasureMode height_mode) {
++  YGSize result = {YGUndefined, YGUndefined};
++  if (g_measure_out_native) {
++    g_measure_out_native(node, width, width_mode, height, height_mode, &result.width, &result.height);
++  }
++  return result;
++}
++
++uint32_t otYogaNodeSetMeasureOutFunc(YGNodeRef node, OTYogaMeasureOutFunc callback,
++                                     uint32_t is_native,
++                                     uint32_t height_cap_only_clamps) noexcept {
++  if (!node || (callback && YGNodeGetChildCount(node))) return OT_YOGA_INVALID_ARGUMENT;
++  if (callback) {
++    if (is_native) {
++      g_measure_out_native = callback;
++    } else {
++      g_measure_out_js = callback;
++    }
++  }
++  YGMeasureFunc trampoline = nullptr;
++  if (callback) {
++    trampoline = is_native ? &otYogaTrampolineMeasureNative : &otYogaTrampolineMeasureJs;
++  }
++  return checked([&] {
++    YGNodeSetMeasureFunc(node, trampoline);
++    facebook::yoga::resolveRef(node)->setHeightCapOnlyClamps(height_cap_only_clamps != 0);
++  });
++}
++
+ void otYogaNodeInvalidateMeasure(YGNodeRef node) noexcept {
+   // No allocation or fallible Yoga operation remains after provider acceptance.
+   // Managed dirtied callbacks contain host errors before returning here.
+diff --git a/packages/native/src/yoga-bridge.h b/packages/native/src/yoga-bridge.h
+index 4115e8b..2dc0466 100644
+--- a/packages/native/src/yoga-bridge.h
++++ b/packages/native/src/yoga-bridge.h
+@@ -47,6 +47,17 @@ uint32_t otYogaNodeCalculateLayout(YGNodeRef node, float width, float height,
+ uint32_t otYogaNodeMarkDirty(YGNodeRef node) OT_YOGA_NOEXCEPT;
+ uint32_t otYogaNodeSetMeasureFunc(YGNodeRef node, YGMeasureFunc callback,
+                                   uint32_t height_cap_only_clamps) OT_YOGA_NOEXCEPT;
++typedef void (*OTYogaMeasureOutFunc)(
++    YGNodeConstRef node,
++    float width,
++    YGMeasureMode width_mode,
++    float height,
++    YGMeasureMode height_mode,
++    float* out_width,
++    float* out_height);
++uint32_t otYogaNodeSetMeasureOutFunc(YGNodeRef node, OTYogaMeasureOutFunc callback,
++                                     uint32_t is_native,
++                                     uint32_t height_cap_only_clamps) OT_YOGA_NOEXCEPT;
+ void otYogaNodeInvalidateMeasure(YGNodeRef node) OT_YOGA_NOEXCEPT;
+ void otYogaNodeForgetMeasurements(YGNodeRef node) OT_YOGA_NOEXCEPT;
+ /* A non-null `content` also gets the node's content box in rounded cells: left and top offsets
+diff --git a/packages/native/src/yoga.zig b/packages/native/src/yoga.zig
+index e047c4f..2f40b27 100644
+--- a/packages/native/src/yoga.zig
++++ b/packages/native/src/yoga.zig
+@@ -303,39 +303,48 @@ pub fn reportMeasureError(node: YGNodeConstRef, err: error{OutOfMemory}) void {
+     if (root.measure_error == .ok) root.measure_error = fromError(err);
+ }
+ 
+-fn internalMeasureFunc(
++fn internalMeasureFuncOut(
+     node: YGNodeConstRef,
+     width: f32,
+     width_mode: c.YGMeasureMode,
+     height: f32,
+     height_mode: c.YGMeasureMode,
+-) callconv(.c) c.YGSize {
++    out_width: [*c]f32,
++    out_height: [*c]f32,
++) callconv(.c) void {
+     if (getConfigContext(node)) |config| {
+         if (config.js_measure) |callback| {
+             // A failing host callback leaves NaNs, Yoga's existing unspecified
+             // size fallback. The host reports the failure after Yoga returns.
+             config.measure_result = .{ .width = std.math.nan(f32), .height = std.math.nan(f32) };
+             callback(@ptrCast(@constCast(node)), width, enumValue(width_mode), height, enumValue(height_mode));
+-            return .{ .width = config.measure_result.width, .height = config.measure_result.height };
++            out_width[0] = config.measure_result.width;
++            out_height[0] = config.measure_result.height;
++            return;
+         }
+         if (config.callbacks.measure) |callback| {
+             const size = callback(config.callbacks.user_data, node, width, enumValue(width_mode), height, enumValue(height_mode));
+-            return .{ .width = size.width, .height = size.height };
++            out_width[0] = size.width;
++            out_height[0] = size.height;
++            return;
+         }
+     }
+-    return .{ .width = std.math.nan(f32), .height = std.math.nan(f32) };
++    out_width[0] = std.math.nan(f32);
++    out_height[0] = std.math.nan(f32);
+ }
+ 
+ /// Native measure callbacks that Yoga made; tests count layout work with it.
+ pub threadlocal var test_native_measures: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {};
+ 
+-fn internalNativeMeasureFunc(
++fn internalNativeMeasureFuncOut(
+     node: YGNodeConstRef,
+     width: f32,
+     width_mode: c.YGMeasureMode,
+     height: f32,
+     height_mode: c.YGMeasureMode,
+-) callconv(.c) c.YGSize {
++    out_width: [*c]f32,
++    out_height: [*c]f32,
++) callconv(.c) void {
+     // Hot native renderables measure entirely in Zig: Yoga -> native renderable
+     // -> native text/editor view. This is separate from the JS callback path.
+     if (builtin.is_test) test_native_measures += 1;
+@@ -348,11 +357,14 @@ fn internalNativeMeasureFunc(
+                 height,
+                 enumValue(height_mode),
+             );
+-            return .{ .width = size.width, .height = size.height };
++            out_width[0] = size.width;
++            out_height[0] = size.height;
++            return;
+         }
+     }
+ 
+-    return .{ .width = std.math.nan(f32), .height = std.math.nan(f32) };
++    out_width[0] = std.math.nan(f32);
++    out_height[0] = std.math.nan(f32);
+ }
+ 
+ fn internalDirtiedFunc(node: YGNodeConstRef) callconv(.c) void {
+@@ -1040,7 +1052,7 @@ pub export fn yogaNodeSetMeasureFuncChecked(node: YGNodeRef, enabled: u32) Statu
+     if (enabled > 1) return .invalid_argument;
+     const status = nodeStatus(node, true, enabled == 0);
+     if (status != .ok) return status;
+-    return @fromBackingInt(@intCast(c.otYogaNodeSetMeasureFunc(node, if (enabled != 0) &internalMeasureFunc else null, 0)));
++    return @fromBackingInt(@intCast(c.otYogaNodeSetMeasureOutFunc(node, if (enabled != 0) &internalMeasureFuncOut else null, 0, 0)));
+ }
+ 
+ pub fn yogaNodeSetNativeMeasureFunc(node: YGNodeRef, target: ?*anyopaque, callback: ?NativeMeasureCallback, height_cap_only_clamps: bool) Status {
+@@ -1049,7 +1061,7 @@ pub fn yogaNodeSetNativeMeasureFunc(node: YGNodeRef, target: ?*anyopaque, callba
+     const status = nodeStatus(node, true, !enabled);
+     if (status != .ok) return status;
+     const ctx = getContext(node).?;
+-    const result: Status = @fromBackingInt(@intCast(c.otYogaNodeSetMeasureFunc(node, if (enabled) &internalNativeMeasureFunc else null, @intFromBool(height_cap_only_clamps))));
++    const result: Status = @fromBackingInt(@intCast(c.otYogaNodeSetMeasureOutFunc(node, if (enabled) &internalNativeMeasureFuncOut else null, 1, @intFromBool(height_cap_only_clamps))));
+     if (result != .ok) return result;
+     c.YGNodeSetNodeType(node, c.YGNodeTypeDefault);
+     ctx.native_measure_target = target;
