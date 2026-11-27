@@ -49,6 +49,7 @@ try {
       "-Werror",
       "-target",
       target,
+      "-nostdlibinc",
       "-isystem",
       path.join(ANDROID_SYSROOT, "usr/include/arm-linux-androideabi"),
       "-isystem",
